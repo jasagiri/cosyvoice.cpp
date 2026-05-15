@@ -9,6 +9,7 @@ add_executable(cosyvoice-tests
     test_config.cpp
     test_graph_routing.cpp
     test_conv1d_contiguity.cpp
+    # test_stft_roundtrip.cpp  # TODO: depends on internal fft/stft symbols hidden by CXX_VISIBILITY_PRESET; re-enable after symbol export or static-link workaround
     test_dit_contiguity.cpp
     test_im2col_chunking.cpp
 )
