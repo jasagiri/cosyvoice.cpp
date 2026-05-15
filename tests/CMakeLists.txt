@@ -9,10 +9,19 @@ add_executable(cosyvoice-tests
     test_config.cpp
     test_graph_routing.cpp
     test_conv1d_contiguity.cpp
-    # test_stft_roundtrip.cpp  # TODO: depends on internal fft/stft symbols hidden by CXX_VISIBILITY_PRESET; re-enable after symbol export or static-link workaround
     test_dit_contiguity.cpp
     test_im2col_chunking.cpp
 )
+
+# test_stft_roundtrip.cpp exercises internal fft/stft symbols (ggml_stft, ggml_istft,
+# create_fft_context, create_istft_context) defined in src/fft.cpp. Under the default
+# shared build these are hidden by CXX_VISIBILITY_PRESET, so the test only links against
+# a static cosyvoice. Configure with -DBUILD_SHARED_LIBS=OFF to enable it.
+if(NOT BUILD_SHARED_LIBS)
+    target_sources(cosyvoice-tests PRIVATE test_stft_roundtrip.cpp)
+else()
+    message(STATUS "tests: test_stft_roundtrip.cpp skipped (requires -DBUILD_SHARED_LIBS=OFF)")
+endif()
 
 target_link_libraries(cosyvoice-tests PRIVATE cosyvoice ggml Catch2::Catch2WithMain)
 target_include_directories(cosyvoice-tests PRIVATE
