@@ -3,6 +3,12 @@
 #include "cosyvoice.h"
 #include "cosyvoice-lowlevel.h"
 
+#include <ggml.h>
+#include <ggml-cpu.h>
+#include <ggml-backend.h>
+
+#include <vector>
+
 SCENARIO("generation config validation accepts valid configurations") {
     GIVEN("a valid generation config") {
         cosyvoice_generation_config_t config{};
@@ -115,6 +121,69 @@ SCENARIO("generation config validation boundary conditions") {
             REQUIRE(-0.1f < 0.0f);   // negative is rejected
             REQUIRE(!(0.0f < 0.0f)); // zero is accepted
         }
+    }
+}
+
+SCENARIO("ggml_backend_tensor_set size parameter must be in bytes") {
+    // Documents a bug found in set_hift_rand_ini where the size parameter
+    // was passed as element count instead of byte count:
+    //   ggml_backend_tensor_set(t, data, 0, nfft / 2 + 1);        // BUG
+    //   ggml_backend_tensor_set(t, data, 0, (nfft/2+1)*sizeof(f)); // FIX
+    //
+    // This caused only 1/4 of the noise initialization data to be written,
+    // leaving the rest as zeros. The effect is subtle — HiFT still runs
+    // but with degraded excitation signal quality.
+
+    GIVEN("a 1D F32 tensor allocated on CPU backend") {
+        auto backend = ggml_backend_cpu_init();
+        REQUIRE(backend != nullptr);
+
+        auto ctx = ggml_init(ggml_init_params{ .mem_size = 1024 * 1024, .no_alloc = true });
+        const int n_elements = 9; // nfft/2 + 1 for nfft=16
+        auto tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_elements);
+
+        auto buft = ggml_backend_get_default_buffer_type(backend);
+        auto buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        REQUIRE(buf != nullptr);
+
+        // Fill with known pattern
+        std::vector<float> data(n_elements);
+        for (int i = 0; i < n_elements; i++)
+            data[i] = static_cast<float>(i + 1);
+
+        WHEN("size is passed as element count (the bug)") {
+            // This only writes n_elements bytes = 9 bytes = 2.25 floats
+            ggml_backend_tensor_set(tensor, data.data(), 0, n_elements);
+
+            std::vector<float> readback(n_elements, -1.0f);
+            ggml_backend_tensor_get(tensor, readback.data(), 0, n_elements * sizeof(float));
+
+            THEN("only the first ~2 elements are partially written") {
+                // First float is complete (4 bytes written)
+                REQUIRE(readback[0] == data[0]);
+                // Second float is complete (8 bytes written)
+                REQUIRE(readback[1] == data[1]);
+                // Third float has only 1 byte written — corrupted
+                REQUIRE(readback[2] != data[2]);
+                // Remaining elements are uninitialized
+            }
+        }
+
+        WHEN("size is passed as byte count (the fix)") {
+            ggml_backend_tensor_set(tensor, data.data(), 0, n_elements * sizeof(float));
+
+            std::vector<float> readback(n_elements, -1.0f);
+            ggml_backend_tensor_get(tensor, readback.data(), 0, n_elements * sizeof(float));
+
+            THEN("all elements are correctly written") {
+                for (int i = 0; i < n_elements; i++)
+                    REQUIRE(readback[i] == data[i]);
+            }
+        }
+
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
     }
 }
 

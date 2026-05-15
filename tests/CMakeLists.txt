@@ -8,6 +8,9 @@ FetchContent_MakeAvailable(Catch2)
 add_executable(cosyvoice-tests
     test_config.cpp
     test_graph_routing.cpp
+    test_conv1d_contiguity.cpp
+    test_dit_contiguity.cpp
+    test_im2col_chunking.cpp
 )
 
 target_link_libraries(cosyvoice-tests PRIVATE cosyvoice ggml Catch2::Catch2WithMain)
