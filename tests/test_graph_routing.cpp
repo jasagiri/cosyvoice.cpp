@@ -1,8 +1,8 @@
-// Graph routing tests for set_graph_backend (HiFT CUSTOM-op routing)
+// Graph routing tests for set_graph_backend and set_graph_backend_per_op.
 //
-// The routing function is static in cosyvoice-tts.cpp, so we test a
-// functionally equivalent reimplementation here. Any algorithm change
-// in cosyvoice-tts.cpp must be reflected in this test.
+// The routing functions are static in cosyvoice-tts.cpp, so we test
+// functionally equivalent reimplementations here. Any algorithm change
+// in cosyvoice-tts.cpp must be reflected in these tests.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -11,6 +11,46 @@
 #include <ggml-backend.h>
 
 #include <vector>
+
+// Reimplementation of set_graph_backend_per_op from cosyvoice-tts.cpp.
+// Routes unsupported ops to CPU based on ggml_backend_supports_op.
+// Virtual ops (VIEW, RESHAPE, PERMUTE, TRANSPOSE) follow their consumer.
+static void set_graph_backend_per_op(
+    ggml_cgraph* gf, ggml_backend_sched_t sched,
+    ggml_backend_t backend, ggml_backend_t cpu_backend, int nodes = -1)
+{
+    if (nodes < 0)
+        nodes = ggml_graph_n_nodes(gf);
+
+    auto is_virtual = [](ggml_op op) {
+        return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
+    };
+
+    for (int i = 0; i != nodes; ++i) {
+        auto node = ggml_graph_node(gf, i);
+        if (is_virtual(node->op))
+            continue;
+        if (cpu_backend && !ggml_backend_supports_op(backend, node))
+            ggml_backend_sched_set_tensor_backend(sched, node, cpu_backend);
+        else
+            ggml_backend_sched_set_tensor_backend(sched, node, backend);
+    }
+
+    for (int i = nodes - 1; i >= 0; --i) {
+        auto node = ggml_graph_node(gf, i);
+        if (!is_virtual(node->op))
+            continue;
+        ggml_backend_t target = backend;
+        for (int j = i + 1; j < nodes; ++j) {
+            auto next = ggml_graph_node(gf, j);
+            if (!is_virtual(next->op)) {
+                target = ggml_backend_sched_get_tensor_backend(sched, next);
+                break;
+            }
+        }
+        ggml_backend_sched_set_tensor_backend(sched, node, target ? target : backend);
+    }
+}
 
 // Reimplementation of set_graph_backend from cosyvoice-tts.cpp for testing.
 // Routes CUSTOM ops (and their trailing VIEW/PERMUTE) to cpu_backend,
@@ -215,6 +255,124 @@ SCENARIO("HiFT routing with dual backends") {
             }
             THEN("trailing VIEW goes to CPU") {
                 REQUIRE(ggml_backend_sched_get_tensor_backend(f.sched, ggml_graph_node(gf, 2)) == cpu2);
+            }
+        }
+    }
+
+    ggml_backend_free(cpu2);
+}
+
+// ============================================================================
+// set_graph_backend_per_op tests (Flow routing)
+// ============================================================================
+
+SCENARIO("per-op routing assigns all supported ops to main backend") {
+    ggml_test_fixture f;
+
+    GIVEN("a graph with only supported ops [MUL, MUL, MUL]") {
+        auto gf = f.build_graph({GGML_OP_MUL, GGML_OP_MUL, GGML_OP_MUL});
+
+        WHEN("set_graph_backend_per_op routes with cpu_backend") {
+            // CPU supports all standard ops, so nothing falls back
+            auto cpu2 = ggml_backend_cpu_init();
+            ggml_backend_sched_free(f.sched);
+            ggml_backend_t backends[] = { f.backend, cpu2 };
+            f.sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+
+            set_graph_backend_per_op(gf, f.sched, f.backend, cpu2);
+
+            THEN("all ops stay on main backend") {
+                for (int i = 0; i < ggml_graph_n_nodes(gf); i++)
+                    REQUIRE(ggml_backend_sched_get_tensor_backend(f.sched, ggml_graph_node(gf, i)) == f.backend);
+            }
+
+            ggml_backend_free(cpu2);
+        }
+    }
+}
+
+SCENARIO("per-op routing: virtual ops follow their consumer") {
+    ggml_test_fixture f;
+    auto cpu2 = ggml_backend_cpu_init();
+    ggml_backend_sched_free(f.sched);
+    ggml_backend_t backends[] = { f.backend, cpu2 };
+    f.sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+
+    GIVEN("a graph with [MUL, VIEW, RESHAPE, MUL]") {
+        auto gf = f.build_graph({GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_RESHAPE, GGML_OP_MUL});
+
+        WHEN("per_op routes the graph") {
+            set_graph_backend_per_op(gf, f.sched, f.backend, cpu2);
+
+            THEN("MUL[0] goes to main") {
+                REQUIRE(ggml_backend_sched_get_tensor_backend(f.sched, ggml_graph_node(gf, 0)) == f.backend);
+            }
+            THEN("VIEW[1] follows its consumer MUL[3] → main") {
+                REQUIRE(ggml_backend_sched_get_tensor_backend(f.sched, ggml_graph_node(gf, 1)) == f.backend);
+            }
+            THEN("RESHAPE[2] follows its consumer MUL[3] → main") {
+                REQUIRE(ggml_backend_sched_get_tensor_backend(f.sched, ggml_graph_node(gf, 2)) == f.backend);
+            }
+            THEN("MUL[3] goes to main") {
+                REQUIRE(ggml_backend_sched_get_tensor_backend(f.sched, ggml_graph_node(gf, 3)) == f.backend);
+            }
+        }
+    }
+
+    GIVEN("a graph with [MUL, PERMUTE, TRANSPOSE, MUL] where MUL is forced to cpu2") {
+        auto gf = f.build_graph({GGML_OP_MUL, GGML_OP_PERMUTE, GGML_OP_TRANSPOSE, GGML_OP_MUL});
+
+        WHEN("last MUL is manually assigned to cpu2 before per_op runs") {
+            // Simulate an unsupported op by manually assigning the last MUL to cpu2
+            // after per_op runs. Instead, we assign all non-virtual, then override.
+            set_graph_backend_per_op(gf, f.sched, f.backend, cpu2);
+            // Override last MUL to cpu2 to simulate unsupported
+            ggml_backend_sched_set_tensor_backend(f.sched, ggml_graph_node(gf, 3), cpu2);
+            // Re-run pass 2 (virtual op assignment) manually
+            for (int i = ggml_graph_n_nodes(gf) - 1; i >= 0; --i) {
+                auto node = ggml_graph_node(gf, i);
+                auto op = node->op;
+                if (op != GGML_OP_VIEW && op != GGML_OP_RESHAPE && op != GGML_OP_PERMUTE && op != GGML_OP_TRANSPOSE)
+                    continue;
+                for (int j = i + 1; j < ggml_graph_n_nodes(gf); ++j) {
+                    auto next = ggml_graph_node(gf, j);
+                    if (next->op != GGML_OP_VIEW && next->op != GGML_OP_RESHAPE && next->op != GGML_OP_PERMUTE && next->op != GGML_OP_TRANSPOSE) {
+                        ggml_backend_sched_set_tensor_backend(f.sched, node, ggml_backend_sched_get_tensor_backend(f.sched, next));
+                        break;
+                    }
+                }
+            }
+
+            THEN("PERMUTE and TRANSPOSE follow their consumer (cpu2)") {
+                REQUIRE(ggml_backend_sched_get_tensor_backend(f.sched, ggml_graph_node(gf, 1)) == cpu2);
+                REQUIRE(ggml_backend_sched_get_tensor_backend(f.sched, ggml_graph_node(gf, 2)) == cpu2);
+            }
+        }
+    }
+
+    GIVEN("a graph with [VIEW, VIEW, MUL] — trailing virtual ops with one consumer") {
+        auto gf = f.build_graph({GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_MUL});
+
+        WHEN("per_op routes the graph") {
+            set_graph_backend_per_op(gf, f.sched, f.backend, cpu2);
+
+            THEN("both VIEWs follow MUL → main") {
+                REQUIRE(ggml_backend_sched_get_tensor_backend(f.sched, ggml_graph_node(gf, 0)) == f.backend);
+                REQUIRE(ggml_backend_sched_get_tensor_backend(f.sched, ggml_graph_node(gf, 1)) == f.backend);
+                REQUIRE(ggml_backend_sched_get_tensor_backend(f.sched, ggml_graph_node(gf, 2)) == f.backend);
+            }
+        }
+    }
+
+    GIVEN("cpu_backend is nullptr — all ops go to main regardless") {
+        auto gf = f.build_graph({GGML_OP_MUL, GGML_OP_VIEW, GGML_OP_MUL});
+
+        WHEN("per_op routes with cpu_backend=nullptr") {
+            set_graph_backend_per_op(gf, f.sched, f.backend, nullptr);
+
+            THEN("all ops go to main backend") {
+                for (int i = 0; i < ggml_graph_n_nodes(gf); i++)
+                    REQUIRE(ggml_backend_sched_get_tensor_backend(f.sched, ggml_graph_node(gf, i)) == f.backend);
             }
         }
     }

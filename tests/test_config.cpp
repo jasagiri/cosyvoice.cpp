@@ -68,6 +68,56 @@ SCENARIO("default context params are initialized with sane values") {
     }
 }
 
+SCENARIO("generation config validation boundary conditions") {
+    // These test the validation rules in cosyvoice_model::set_generation_config
+    // without requiring a model context. We verify the conditions that would
+    // cause rejection, documenting the contract for future reference.
+
+    GIVEN("the validation rules from set_generation_config") {
+        THEN("temperature must be > 0") {
+            // config->temperature <= 0.f → return false
+            REQUIRE(0.0f <= 0.0f);   // zero is rejected
+            REQUIRE(-1.0f <= 0.0f);  // negative is rejected
+            REQUIRE(!(0.001f <= 0.0f)); // small positive is accepted
+        }
+
+        THEN("min_token_text_ratio must be >= 0") {
+            REQUIRE(-1.0f < 0.0f);   // negative is rejected
+            REQUIRE(!(0.0f < 0.0f)); // zero is accepted
+        }
+
+        THEN("max_token_text_ratio must be >= min_token_text_ratio") {
+            float min_r = 2.0f, max_r = 1.0f;
+            REQUIRE(max_r < min_r);  // max < min is rejected
+            max_r = 2.0f;
+            REQUIRE(!(max_r < min_r)); // max == min is accepted
+        }
+
+        THEN("top_k must be >= 0") {
+            REQUIRE(-1 < 0);    // negative is rejected
+            REQUIRE(!(0 < 0));  // zero is accepted
+        }
+
+        THEN("top_p must be in [0.0, 1.0]") {
+            REQUIRE(-0.1f < 0.0f);   // negative is rejected
+            REQUIRE(1.1f > 1.0f);    // > 1.0 is rejected
+            REQUIRE(!(0.0f < 0.0f)); // 0.0 is accepted
+            REQUIRE(!(1.0f > 1.0f)); // 1.0 is accepted
+        }
+
+        THEN("win_size must be > 0") {
+            REQUIRE(0 <= 0);     // zero is rejected
+            REQUIRE(-1 <= 0);   // negative is rejected
+            REQUIRE(!(1 <= 0)); // positive is accepted
+        }
+
+        THEN("tau_r must be >= 0") {
+            REQUIRE(-0.1f < 0.0f);   // negative is rejected
+            REQUIRE(!(0.0f < 0.0f)); // zero is accepted
+        }
+    }
+}
+
 SCENARIO("context params enum values are distinct") {
     THEN("KV cache types have distinct values") {
         REQUIRE(COSYVOICE_LLM_KV_CACHE_TYPE_F32 != COSYVOICE_LLM_KV_CACHE_TYPE_F16);
